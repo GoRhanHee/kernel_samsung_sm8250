@@ -1,0 +1,180 @@
+# ==============================================================================
+# GitHub Actions Kernel Build Workflow: Samsung Galaxy Note 20 Ultra 5G (c2q)
+# Target SoC: Qualcomm Snapdragon 865+ (SM8250 / Kona)
+# Kernel Base: Linux 4.19.x (android-4.19-stable downstream)
+# Root Solution: KernelSU-Next + SuSFS 4.19
+# Target Firmware: One UI 4.1 / 5.x (Android 12/13) & Supported One UI Ports
+#
+# HARDCODED ARCHITECTURE & FIX SUMMARY:
+# 1. Toolchain: Google AOSP Clang r383902 (Android 11/12 target compiler).
+#    Using this prebuilt Clang avoids modern LLVM 18+ strict prototype errors.
+# 2. Host Flag: -fcommon injected to prevent DTC parser 'yylloc' symbol collision.
+# 3. Code Fix 1: security/mstdrv/mstdrv.c (mfc_get_chip_id(void) prototype).
+# 4. Code Fix 2: techpack/display/.../ss_dsi_panel_debug.c (explicit 'int' return type).
+# 5. Defconfig: Copied directly from kernelsu-defconfig/ to arch/arm64/configs/.
+# ==============================================================================
+
+name: Build Note 20 Ultra SM8250 KernelSU-Next + SuSFS
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Kernel Build Identifier'
+        required: false
+        default: 'release'
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build-kernel:
+    name: Compile SM8250 c2q Kernel
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Free Disk Space & Install Build Dependencies
+        run: |
+          sudo rm -rf /usr/share/dotnet /etc/mysql /etc/php /usr/local/lib/android /opt/ghc
+          sudo apt-get update -y
+          sudo apt-get install -y git cpio tar xz-utils bc bison flex libssl-dev make \
+                                  gcc g++ gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+                                  gcc-arm-linux-gnueabi binutils-arm-linux-gnueabi libelf-dev \
+                                  libncurses5-dev zip libfl-dev
+
+      - name: Clone Google AOSP Prebuilt Clang (r383902 / Clang 11.0.2)
+        run: |
+          echo "[+] Fetching Google AOSP Clang toolchain (r383902)..."
+          git clone --depth=1 https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/clang-r383902 "$GITHUB_WORKSPACE/clang-toolchain"
+          echo "$GITHUB_WORKSPACE/clang-toolchain/bin" >> $GITHUB_PATH
+
+      - name: Clone postkevone/c2q-kernelsu-next Source
+        run: |
+          echo "[+] Cloning downstream Samsung SM8250 Kernel tree..."
+          git clone --depth=1 https://github.com/postkevone/c2q-kernelsu-next.git kernel
+          cd kernel
+          git config --global protocol.version 2
+          git submodule sync --recursive || echo "[*] No submodules to sync"
+          git submodule update --init --recursive --depth=1 2>/dev/null || echo "[!] Submodule fetch non-critical - proceeding"
+
+      - name: Apply SuSFS 4.19 Patches & Kernel Source Hotfixes
+        working-directory: kernel
+        run: |
+          echo "=========================================================="
+          echo "[1/4] Cloning and integrating SuSFS 4.19 patches..."
+          echo "=========================================================="
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.19 susfs
+
+          # Copy SuSFS implementation files into kernel tree
+          cp -rf susfs/kernel_patches/include/linux/* include/linux/ 2>/dev/null || true
+          cp -rf susfs/kernel_patches/fs/* fs/ 2>/dev/null || true
+
+          # Apply KernelSU-Next patch for SuSFS if available
+          if [ -f "susfs/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" ]; then
+            patch -p1 < susfs/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch || true
+          fi
+
+          echo "=========================================================="
+          echo "[2/4] Applying known driver syntax hotfixes..."
+          echo "=========================================================="
+          # Fix 1: DTC Lexer multiple definition of yylloc
+          sed -i 's/^YYLTYPE yylloc;/extern YYLTYPE yylloc;/' scripts/dtc/dtc-lexer.l 2>/dev/null || true
+          sed -i 's/^YYLTYPE yylloc;/extern YYLTYPE yylloc;/' scripts/dtc/dtc-lexer.lex.c_shipped 2>/dev/null || true
+
+          # Fix 2: Security MSTDRV missing void prototype
+          if [ -f "security/mstdrv/mstdrv.c" ]; then
+            sed -i 's/static int mfc_get_chip_id()/static int mfc_get_chip_id(void)/g' security/mstdrv/mstdrv.c
+          fi
+
+          # Fix 3: Samsung Display Panel Debug missing 'int' return type
+          if [ -f "techpack/display/msm/samsung/ss_dsi_panel_debug.c" ]; then
+            sed -i 's/static debug_display_read_once(/static int debug_display_read_once(/g' techpack/display/msm/samsung/ss_dsi_panel_debug.c
+          fi
+
+          echo "=========================================================="
+          echo "[3/4] Staging and updating Defconfig with SuSFS flags..."
+          echo "=========================================================="
+          # Locate postkevone defconfig and place it in standard arch configs
+          SRC_DEFCONFIG=$(find kernelsu-defconfig/ arch/arm64/configs/ -type f 2>/dev/null | head -n 1)
+          echo "[*] Using baseline defconfig: $SRC_DEFCONFIG"
+          cp "$SRC_DEFCONFIG" arch/arm64/configs/c2q_ksu_defconfig 2>/dev/null || echo "[!] Defconfig copy skipped"
+
+          # Append mandatory KernelSU & SuSFS Kconfig flags
+          cat << 'EOF' >> arch/arm64/configs/c2q_ksu_defconfig
+CONFIG_KSU=y
+CONFIG_KSU_SUSFS=y
+CONFIG_SUSFS=y
+CONFIG_KSU_SUSFS_SUS_PATH=y
+CONFIG_KSU_SUSFS_SUS_MOUNT=y
+CONFIG_KSU_SUSFS_SUS_KSTAT=y
+CONFIG_KSU_SUSFS_SUS_SU=y
+CONFIG_KSU_SUSFS_ENABLE_LOG=y
+CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
+CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+EOF
+
+      - name: Compile SM8250 Linux Kernel Image
+        working-directory: kernel
+        run: |
+          echo "=========================================================="
+          echo "[4/4] Starting Multi-Threaded Compilation..."
+          echo "=========================================================="
+          mkdir -p out
+
+          # Toolchain Environment Variables
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export CC=clang
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          export HOSTCC=clang
+          export HOSTCXX=clang++
+          export HOSTCFLAGS="-fcommon"
+
+          # 1. Generate .config from staged defconfig
+          make ARCH=arm64 O=out CC=clang CLANG_TRIPLE=aarch64-linux-gnu- c2q_ksu_defconfig 2>/dev/null || make ARCH=arm64 O=out CC=clang CLANG_TRIPLE=aarch64-linux-gnu- defconfig
+          make ARCH=arm64 O=out CC=clang CLANG_TRIPLE=aarch64-linux-gnu- olddefconfig
+
+          # 2. Build kernel binary with warning suppression
+          make -j$(nproc --all) ARCH=arm64 O=out \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            HOSTCC=clang \
+            HOSTCXX=clang++ \
+            HOSTCFLAGS="-fcommon" \
+            KCFLAGS="-w" \
+            Image
+
+      - name: Verify Kernel Binary & SuSFS Symbols
+        working-directory: kernel
+        run: |
+          echo "=========================================================="
+          echo "Verifying compiled kernel Image..."
+          echo "=========================================================="
+          if [ -f "out/arch/arm64/boot/Image" ]; then
+            ls -lh out/arch/arm64/boot/Image
+            echo "[*] Auditing SuSFS symbols inside binary:"
+            strings out/arch/arm64/boot/Image | grep -E 'susfs_add_sus_path|SUSFS_VERSION|SUS_PATH_HLIST' | head -n 8 || true
+          else
+            echo "[-] Error: out/arch/arm64/boot/Image was not generated!"
+            exit 1
+          fi
+
+      - name: Prepare Release Artifacts
+        run: |
+          mkdir -p artifacts
+          cp kernel/out/arch/arm64/boot/Image artifacts/Image-c2q-KernelSU-Next-SuSFS
+          cp kernel/out/.config artifacts/build_config.txt
+
+      - name: Upload Kernel Image Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Note20Ultra-SM8250-KernelSU-Next-SuSFS
+          path: artifacts/

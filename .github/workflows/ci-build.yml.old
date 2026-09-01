@@ -1,0 +1,138 @@
+# Kernel CI build for Samsung SM8250 (c2q branch)
+# Creates build environment, installs toolchain packages, ensures KBUILD_OUTPUT/out directories,
+# supports workflow_dispatch for manual runs and triggers on push/pull_request to branch c2q.
+
+on:
+  push:
+    branches:
+      - c2q
+  pull_request:
+    branches:
+      - c2q
+  workflow_dispatch:
+
+name: Kernel CI Build (c2q)
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build-kernel:
+    name: Build kernel (arm64, c2q)
+    runs-on: ubuntu-22.04
+    env:
+      ARCH: arm64
+      CROSS_COMPILE: aarch64-linux-gnu-
+      KBUILD_OUTPUT: ${{ github.workspace }}/out
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+          submodules: false
+
+      - name: Validate .gitmodules
+        run: |
+          if [ -f .gitmodules ]; then
+            echo "[*] .gitmodules found, validating..."
+            cat .gitmodules
+            git config --file .gitmodules --get-regexp '^submodule.*url' || echo "[!] Warning: No submodule URLs found"
+          else
+            echo "[*] No .gitmodules file - proceeding without submodules"
+          fi
+
+      - name: Clean git state and initialize submodules safely
+        run: |
+          # Remove any cached submodule references that may point to deleted commits
+          git submodule deinit -f --all 2>/dev/null || true
+          rm -rf .git/modules 2>/dev/null || true
+          git clean -fdx .git/modules 2>/dev/null || true
+          
+          # Sync and initialize with full history (no shallow clone for submodules)
+          git config --global protocol.version 2
+          git submodule sync --recursive || echo "[!] No submodules to sync"
+          git submodule update --init --recursive --depth=1 || echo "[!] Submodule fetch failed (non-critical - proceeding)"
+
+      - name: Set up QEMU (optional for container/toolchain use)
+        uses: docker/setup-qemu-action@v2
+        if: false
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev ccache rsync \
+            libncurses-dev libelf-dev dwarves cpio python3 python3-setuptools python3-dev\
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu wget
+          ccache --max-size=1G || true
+
+      - name: Create build output directories
+        run: |
+          mkdir -p "${KBUILD_OUTPUT}"
+          mkdir -p "${KBUILD_OUTPUT}/modules"
+          mkdir -p "${KBUILD_OUTPUT}/arch/arm64/boot"
+
+      - name: Export build environment variables
+        run: |
+          echo "ARCH=${ARCH}" >> $GITHUB_ENV
+          echo "CROSS_COMPILE=${CROSS_COMPILE}" >> $GITHUB_ENV
+          echo "KBUILD_OUTPUT=${KBUILD_OUTPUT}" >> $GITHUB_ENV
+
+      - name: Use device defconfig if present
+        id: defconfig
+        run: |
+          DEVICE_DEFCONFIG="vendor/samsung/defconfig"
+          if [ -f "$GITHUB_WORKSPACE/defconfig" ]; then
+            echo "Found repo root defconfig"
+            cp defconfig ${KBUILD_OUTPUT}/.config
+            echo "used=repo-root" >> $GITHUB_OUTPUT
+          elif [ -f "$GITHUB_WORKSPACE/$DEVICE_DEFCONFIG" ]; then
+            echo "Found device defconfig: $DEVICE_DEFCONFIG"
+            cp "$DEVICE_DEFCONFIG" ${KBUILD_OUTPUT}/.config
+            echo "used=device" >> $GITHUB_OUTPUT
+          else
+            if ls arch/arm64/configs/* 1> /dev/null 2>&1; then
+              echo "Falling back to make defconfig"
+              make O=${KBUILD_OUTPUT} defconfig
+              echo "used=auto-defconfig" >> $GITHUB_OUTPUT
+            else
+              echo "No defconfig found. Please provide a device defconfig or .config in the repo."
+              echo "used=none" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Build kernel (Image, dtbs, modules)
+        run: |
+          set -e
+          echo "Build env: ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE KBUILD_OUTPUT=$KBUILD_OUTPUT"
+          make -j$(nproc) O=${KBUILD_OUTPUT} Image dtbs modules
+
+      - name: Install modules to staging and package outputs
+        run: |
+          MOD_STAGING=${KBUILD_OUTPUT}/modules-staging
+          mkdir -p ${MOD_STAGING}
+          make -j$(nproc) O=${KBUILD_OUTPUT} INSTALL_MOD_PATH=${MOD_STAGING} modules_install
+          (cd ${KBUILD_OUTPUT} && tar -czf ${GITHUB_WORKSPACE}/kernel-out.tar.gz .)
+          (cd ${MOD_STAGING} && tar -czf ${GITHUB_WORKSPACE}/kernel-modules.tar.gz .)
+
+      - name: Show built files
+        run: |
+          echo "Listing output dir"
+          ls -lah ${KBUILD_OUTPUT} || true
+          echo "Listing boot dir"
+          ls -lah ${KBUILD_OUTPUT}/arch/arm64/boot || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-artifacts-c2q
+          path: |
+            kernel-out.tar.gz
+            kernel-modules.tar.gz
+            out/arch/arm64/boot/Image
+            out/arch/arm64/boot/Image.gz
+            out/arch/arm64/boot/zImage
+            out/arch/arm64/boot/dts/**/*.dtb
